@@ -1,0 +1,13 @@
+# Build output — regenerate with `python build.py`
+tenant-research.skill
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
