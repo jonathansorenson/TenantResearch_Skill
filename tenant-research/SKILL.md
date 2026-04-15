@@ -50,14 +50,28 @@ Before diving in, understand what makes or breaks this report:
 6. **Table cell wrapping** — Use Paragraph objects (not plain strings) for any table cell
    that may contain more than ~15 characters. Plain strings do not wrap and will overflow
    into adjacent columns, creating garbled text.
+7. **Parallel sub-agent dispatch.** The main agent does NOT research domains itself. It
+   dispatches **nine sub-agents in parallel** (single message, multiple Agent/Task tool calls):
+   one per research domain (A.0, A, B, C, D, E, F, G) plus one to fetch the tenant logo.
+   The main agent waits for all nine returns, then synthesizes (reconcile, re-calibrate
+   scores, select logo, compile PDFs). Serial research by the main agent is a defect — it
+   is both slower and worse-calibrated than parallel specialist dispatch.
 
 ## Workflow Overview
 
 1. **Identify the company** — Confirm the company name, location, and any context the user provides
 2. **Classify the company** — Public vs. private vs. non-profit/government (this shapes research strategy)
-3. **Research** — Gather data across ALL SEVEN domains (A through G below). Do not skip any.
-4. **Score** — Apply the composite risk scoring framework (six dimensions, 100-point scale)
-5. **Build the PDF** — Generate a visually polished, presentation-grade PDF using the bundled charts.py
+3. **Dispatch sub-agents in parallel** — Spawn nine sub-agents in a single message: eight research
+   agents (A.0 Fundamentals, A Financial, B Market, C Leadership, D Legal, E CRE Signals,
+   F Industry, G ESG) plus one logo agent. Each sub-agent has a narrow brief and its own
+   web-research budget.
+4. **Synthesize** — Once all nine have returned, validate cross-agent consistency (entity
+   name matches across returns), re-calibrate proposed scores against the archetype table,
+   select the logo (fetched image if available, else `build_cover_logos()` fallback).
+5. **Score** — Apply the composite risk scoring framework (six dimensions, 100-point scale)
+   using the reconciled per-dimension scores.
+6. **Build the PDFs** — Generate BOTH the full report PDF AND the 1-page summary PDF using
+   the bundled `charts.py` and `logos.py`.
 
 ## Step 1: Gather Context
 
@@ -70,6 +84,12 @@ Before researching, confirm or infer:
 
 If the user only gives a company name, that's fine — start researching and surface what you find.
 Don't over-ask; use your judgment to fill gaps from public data.
+
+Note: the structured identity data (legal entity name, entity type, state of incorporation,
+state registration doc #, registered agent, officers, website, parent company) is captured
+formally in subsection A.0 Company Fundamentals & Structure. Step 1 is the informal hand-shake
+with the user; A.0 is where the data is pulled from state databases and rendered into the
+report. Do not skip A.0 even if Step 1 produced the entity name.
 
 ## Step 2: Classify and Adapt Research Strategy
 
@@ -87,11 +107,192 @@ Be transparent about confidence levels when data is inferred or estimated.
 **Non-profit / Government** — Budget documents, grant funding, bond ratings, legislative
 appropriations, mission stability. Different financial framework but still scoreable.
 
+## Orchestration: Parallel Research Dispatch
+
+The main agent running this skill MUST fan out research work to nine parallel sub-agents. The
+main agent does not research any domain itself — its job is to dispatch, wait, synthesize,
+and compile. This is the single biggest lever for speed and quality on a tenant report.
+
+### Why parallel dispatch
+
+- **Speed.** Nine sub-agents run concurrently in ~the time one serial research pass takes.
+- **Specialization.** Each sub-agent has a narrow brief and can go deeper on its domain
+  without diluting attention across unrelated areas.
+- **Calibration isolation.** Scoring drift (e.g., a legal agent over-penalizing litigation)
+  is caught in the synthesis pass and re-normalized against the cross-dimension archetype
+  table. Serial research has no such checkpoint.
+- **Logo quality.** A dedicated logo agent can exhaust the logo-fetch search paths
+  (company press kit → Wikipedia → brand-asset aggregators) while research proceeds,
+  instead of settling for the text fallback.
+
+### How to dispatch
+
+Dispatch **all nine sub-agents in a single message**, with multiple Agent/Task tool calls in
+that message. Single-message multi-tool-call is what makes the dispatch truly parallel.
+Issuing them one at a time serializes them.
+
+Each sub-agent gets:
+- The tenant name, HQ, property context, and any user-provided hints
+- Its specific section brief (copy the relevant domain brief from Step 3 below)
+- An instruction to return a structured envelope (see return contract below)
+- A max-token / max-web-calls budget appropriate to its domain
+
+### The nine sub-agents
+
+| # | Name | Brief location | Scored? | Primary sources |
+|---|------|----------------|---------|-----------------|
+| 1 | **Fundamentals** (A.0) | Step 3 § A.0 | No (narrative) | State business-entity databases, 10-K cover page, company website |
+| 2 | **Financial** (A) | Step 3 § A | Yes → Financial Strength & Credit | SEC filings, credit-rating agencies, news, annual reports |
+| 3 | **Market** (B) | Step 3 § B | Yes → Market Position | Industry reports, competitive analyses, market-share data |
+| 4 | **Leadership** (C) | Step 3 § C | Yes → Leadership & Personnel | Executive bios, proxy statements, news, Glassdoor |
+| 5 | **Legal** (D) | Step 3 § D | Yes → Legal & Regulatory | PACER, state court dockets, SEC litigation releases, regulatory actions |
+| 6 | **CRE Signals** (E) | Step 3 § E (incl. E.1) | Yes → CRE Track Record | Lease filings, news on store closures/openings, anchor-tenant registries |
+| 7 | **Industry** (F) | Step 3 § F | Yes → Industry Outlook | IBIS / industry reports, sector forecasts, trade press |
+| 8 | **ESG** (G) | Step 3 § G | No (narrative) | ESG ratings (MSCI, Sustainalytics), news, corporate sustainability reports |
+| 9 | **Logo** | (see below) | No | Company press kit, Wikipedia, logo aggregators |
+
+### Research sub-agent return contract
+
+Every research sub-agent (#1–8) must return a JSON-serializable envelope with these fields:
+
+```python
+{
+    "section": "A",  # A.0, A, B, C, D, E, F, or G
+    "findings": "...",  # Markdown-formatted prose for the report section, 300–1000 words
+    "key_facts": [  # 3–10 bullet-ready facts with structured values where applicable
+        {"label": "Revenue (TTM)", "value": "$37.2B", "source": "Q4 2025 10-K"},
+        ...
+    ],
+    "draft_score": 92,  # 0-100, only for scored domains (A, B, C, D, E, F); else null
+    "score_rationale": "...",  # 2-4 sentences: why this score, what would move it
+    "confidence": "high",  # high / moderate / low — data sufficiency, not the score itself
+    "sources": ["https://...", "https://..."],  # 3–15 URLs consulted
+    "flags": ["..."]  # optional: issues for the synthesizer (e.g., "entity name mismatch with A.0")
+}
+```
+
+### Logo sub-agent brief
+
+The logo sub-agent has one job: find the highest-quality version of the tenant's brand logo
+as an embeddable asset. Its brief:
+
+> Find the official brand logo for **{tenant_name}**. Preference order:
+> 1. Company press-kit page (usually /press, /media, /brand, /about/brand — look for downloadable
+>    logo assets)
+> 2. Wikipedia infobox logo (usually SVG)
+> 3. Brand-asset aggregators (Brandfetch, Clearbit logo API, seeklogo.com) — only if official
+>    sources fail
+>
+> Return the following envelope:
+
+```python
+{
+    "logo_url": "https://...",  # Direct URL to the logo image (PNG or SVG preferred)
+    "logo_format": "png",  # svg / png / jpg
+    "downloaded_path": "/tmp/tenant_logo.png",  # If fetched locally during research
+    "brand_color_hex": "#E51636",  # Primary brand color for fallback and badge tinting
+    "fallback_used": false,  # True if no asset found and text logo is required
+    "sources": ["https://..."],  # Where the logo was sourced from
+    "notes": "..."  # Any quality issues (e.g., "only low-res PNG available")
+}
+```
+
+If the logo sub-agent cannot find any asset, it returns `fallback_used=true` and the synthesis
+step uses `build_cover_logos(company_name)`'s text-based tenant logo with the brand color.
+
+### Dispatch example (conceptual)
+
+```python
+# In the main agent's single message, dispatch all nine:
+dispatch([
+    Agent(subagent_type="research", prompt=a0_fundamentals_brief),
+    Agent(subagent_type="research", prompt=a_financial_brief),
+    Agent(subagent_type="research", prompt=b_market_brief),
+    Agent(subagent_type="research", prompt=c_leadership_brief),
+    Agent(subagent_type="research", prompt=d_legal_brief),
+    Agent(subagent_type="research", prompt=e_cre_signals_brief),
+    Agent(subagent_type="research", prompt=f_industry_brief),
+    Agent(subagent_type="research", prompt=g_esg_brief),
+    Agent(subagent_type="research", prompt=logo_fetch_brief),
+])
+# ... all nine run in parallel, results collected, then synthesis begins.
+```
+
+The main agent then proceeds to the **Synthesis** section below (after Step 3).
+
 ## Step 3: Research Domains
 
-Research every company across these six domains. The depth will vary by what's available, but
-every domain should appear in the final output — even if the finding is "limited public data
-available; recommend direct financial statement request."
+The eight domain briefs below are **sub-agent prompts**, not serial instructions for the main
+agent. Each describes what ONE dispatched sub-agent researches. Copy the relevant brief into
+the Agent/Task tool call when dispatching. Every domain must appear in the final report — even
+if a sub-agent's finding is "limited public data available; recommend direct financial statement
+request."
+
+### A.0 Company Fundamentals & Structure
+
+Core question: *Who exactly is this tenant, legally and operationally?*
+
+This subsection establishes the identity of the entity that would sign the lease and who stands
+behind it. It is narrative, not scored — but the facts gathered here feed directly into the
+Financial Strength and CRE Track Record dimensions (especially the corporate-guarantee analysis)
+and appear on the cover page and the 1-page summary.
+
+**Fields to capture for every tenant:**
+- Full legal entity name (including suffix: LLC, LLP, Inc., Corp., PA, PLLC, Ltd., etc.)
+- Legal entity type
+- State of incorporation / formation
+- State registration doc # (filing number / entity ID)
+- Registration status (Active / Inactive / Dissolved / Administratively Dissolved / Merged)
+- Original filing date (and date of last annual report if available)
+- Registered agent (name + address)
+- Officers / managers / directors on record (names + titles)
+- Principal business address (as filed with the state)
+- Tenant website URL
+- Parent company / ultimate parent (if any)
+- Subsidiaries and affiliated brands (material ones — not exhaustive)
+- Corporate structure narrative (2–3 sentences explaining the lease counterparty, the parent
+  if any, and who is expected to provide the corporate guarantee)
+
+#### Research procedure — state registration lookup
+
+1. **Start with what the user gave you.** If the user named a specific state of incorporation
+   or entity type, use that as your starting point.
+2. **If not provided, identify the state of incorporation.** For public companies, the 10-K
+   cover page states the state of incorporation. For private companies, check the company's
+   "About" / "Contact" / "Legal" website pages, franchise disclosure documents, and news
+   mentions. If still ambiguous, check HQ state first — most private companies register in
+   their HQ state, Delaware, or Nevada.
+3. **Pull the official registration from the appropriate state's business-entity database.**
+   This is NOT limited to Florida. Use the state's official source:
+   - **Florida:** SunBiz — https://search.sunbiz.org
+   - **Delaware:** Division of Corporations — https://icis.corp.delaware.gov/ecorp/entitysearch
+   - **California:** Secretary of State BizFile — https://bizfileonline.sos.ca.gov/search/business
+   - **Texas:** SOSDirect — https://direct.sos.state.tx.us (free Taxable Entity Search at
+     https://mycpa.cpa.state.tx.us/coa)
+   - **New York:** NYS Department of State Corporation & Business Entity Database —
+     https://apps.dos.ny.gov/publicInquiry
+   - **Georgia:** Corporations Division search — https://ecorp.sos.ga.gov/BusinessSearch
+   - **Illinois:** Business Entity Search — https://apps.ilsos.gov/businessentitysearch
+   - **Any other state:** Web search `"[state name] secretary of state business entity search"`
+     and use the official `.gov` result. Do NOT rely on third-party aggregators
+     (OpenCorporates, Bizapedia, ZoomInfo) as the primary source — use them only to cross-check.
+4. **Capture all standardized fields** above. If a field is unavailable in a particular state's
+   database (some states don't publish officers, for example), say so explicitly rather than
+   omitting the field.
+5. **Cross-check the entity type against the lease counterparty.** If the LOI names "Starbucks
+   Corp" but state records show "Starbucks Coffee Company" as the operating entity, surface
+   the mismatch — it affects the corporate guarantee analysis.
+
+#### Presentation in the report
+
+Render the A.0 findings as a two-column "Company Fundamentals" table near the top of Section A,
+followed by the 2–3 sentence corporate-structure narrative. Use Paragraph objects for cell
+content so long registered-agent addresses wrap properly. Do not score this subsection — it is
+context. The data flows into:
+- Cover page key-facts block (see "Page 1 — Cover" section)
+- 1-page summary key-facts box (see "1-Page Summary Deliverable" section)
+- Financial Strength dimension (lease counterparty, corporate guarantee)
+- CRE Track Record dimension (entity's lease history, which requires the correct entity name)
 
 ### A. Financial Health & Creditworthiness
 
@@ -119,11 +320,52 @@ This is the most important section of the report. Give it proportional depth.
 - Bankruptcy history or restructuring events
 - For private companies: estimated revenue range, funding history, known investors
 
-**Scoring guidance for this dimension:** An investment-grade company with no lease default
-history should score 80+ on Financial Strength regardless of near-term earnings headwinds
-or margin compression. A negative credit outlook might bring it to 75-80 (C range), not
-into the 60s. Reserve scores below 60 (F) for companies with actual credit distress
-signals: junk ratings, covenant violations, cash burn, or prior defaults.
+**Scoring guidance for this dimension — calibration archetypes.** Scores must reflect actual
+differentiation between tenants, not timidity. A "90" should be common for healthy national
+brands; anchor the top of the scale to institutional quality, not perfection. Use these
+archetypes when scoring Financial Strength & Credit:
+
+- **95–100 — Elite private or public blue-chip.** Dominant brand, no default history, consistent
+  revenue growth, strong cash position, low or manageable leverage. Fortune 500 investment-grade
+  issuers (Apple, Costco, Microsoft, Walmart), or top-tier private operators with well-documented
+  institutional-grade financials and no lease-rejection history (Chick-fil-A, Publix, In-N-Out,
+  Mars, Cargill, Koch). A private but financially elite brand with no defaults, dominant
+  position, and healthy growth belongs here — not in the low 90s.
+- **88–94 — Strong national or large regional.** Investment-grade or inferred-investment-grade
+  credit, steady growth, solid margins, no material distress signals. Most large publicly traded
+  retailers, banks, and restaurant chains with BBB/BBB+ ratings and healthy cash flow (e.g.,
+  Starbucks, McDonald's, Home Depot, Target). A negative outlook alone does NOT drop a score
+  out of this band.
+- **80–87 — Mid-tier national chain with healthy fundamentals.** Profitable, growing or stable,
+  no recent distress, but smaller scale, thinner margins, higher leverage, or a shorter public
+  track record than the 88+ cohort.
+- **72–79 — Regional operator with adequate financials, or national brand with softening
+  fundamentals.** Revenue pressure, margin compression, elevated leverage, or opaque private
+  financials. A negative credit outlook plus weakening comp-store sales could land a name here.
+- **62–71 — Meaningful stress signals but not imminent distress.** High-yield credit, covenant
+  tightness, declining revenue, recent CFO departure, private company with thin financial
+  visibility and no documented cushion.
+- **50–61 — Actual credit distress risk.** Junk-rated with negative outlook, covenant
+  violations, cash burn, recent restructuring, material lawsuits with solvency implications.
+- **Below 50 — Prior default, active bankruptcy risk, or effectively insolvent.** Reserve for
+  the rare case where the public record shows the tenant cannot reasonably perform for the full
+  lease term.
+
+**Calibration rules that apply across all six dimensions:**
+- A blue-chip brand with no negative signals should land 95+ on Financial Strength, Market
+  Position, and Industry Outlook. The composite for such a tenant should routinely be 94–98,
+  not low 90s.
+- Reserve scores below 70 for clear distress; below 60 for actual default risk. Do not let
+  secondary concerns (labor disputes, ESG controversies, a recent CEO hire) pull an otherwise
+  institutional-grade tenant below 85 on any dimension.
+- A negative credit outlook is a 3–5 point haircut on Financial Strength, not a band drop.
+- Private companies are not automatically scored lower for being private. If the brand is
+  dominant and there is no evidence of distress, treat the absence of SEC filings as a
+  data-confidence issue (Moderate confidence) rather than a risk signal (score deduction).
+- The Chick-fil-A reference profile — private, financially elite, dominant brand, no default
+  history, healthy growth — should score 95+ on Financial Strength, 95+ on Market Position,
+  and pull the composite into the high 90s. If your scoring produces a lower result for a
+  tenant matching that profile, recheck your per-dimension rubric before finalizing.
 
 ### B. Market & Competitive Position
 
@@ -283,6 +525,87 @@ Core question: *Are there reputational or sustainability factors that affect des
 - Brand strength and public perception
 - Any controversies or negative press cycles
 
+## Synthesis: Reconcile Sub-Agent Returns
+
+Once all nine sub-agents have returned their envelopes, the main agent enters the synthesis
+phase. **Do not begin synthesis until every sub-agent has reported.** A single missing or
+failed return degrades the final product — if a sub-agent failed, either re-dispatch that
+single agent or explicitly mark its section as "data gap" before proceeding.
+
+The synthesis phase produces three outputs, in this order:
+
+### Step 1 of synthesis — Reconcile findings
+
+1. **Entity-name consistency check.** Compare the legal entity name across A.0, A, D, and E
+   returns. If they disagree (e.g., A.0 says "Chick-fil-A, Inc.", A says "Chick-fil-A
+   Restaurants LLC"), flag it to the user and use A.0's value as authoritative (A.0 pulls
+   from the state business-entity database).
+2. **Counterparty and guarantee alignment.** The financial agent's corporate-guarantee analysis
+   must reference the same entity the A.0 agent captured as the state-registered signer.
+   Mismatch → re-read both returns and call out which entity would actually sign the lease.
+3. **Site-specific cross-check.** If E returned location-level analysis but did not use the
+   same parent brand A.0 identified, the E brief missed the parent's footprint — patch the
+   E findings using A.0's parent/subsidiary data before scoring CRE Track Record.
+4. **Cite hygiene.** Deduplicate sources across envelopes. Surface any contradictions
+   between sources (e.g., revenue figure in A vs. revenue mentioned in F) and resolve to
+   the more authoritative source.
+
+### Step 2 of synthesis — Re-calibrate scores
+
+Each scored sub-agent (A, B, C, D, E, F) returned a `draft_score`. These are proposals — the
+main agent is responsible for global calibration consistency.
+
+Apply these reconciliation rules **before accepting any draft score**:
+
+1. **Check against the archetype table.** Look up the tenant's profile row in the
+   cross-dimension archetype table (see Step 4 below). If a draft score falls outside the
+   typical range for that profile, the sub-agent was likely mis-calibrated — revise toward
+   the archetype range unless the sub-agent's rationale cites a specific distress signal that
+   justifies the deviation.
+2. **Floor and ceiling rules.** A blue-chip profile (Apple / Costco / Chick-fil-A / Publix
+   archetype) must land 95+ on Financial Strength, Market Position, and Industry Outlook
+   unless the sub-agent documented a material distress signal. A negative credit outlook is a
+   3–5 point haircut, not a band drop. Secondary concerns (labor disputes, ESG controversies,
+   recent CEO hire) cannot pull a fundamentally creditworthy tenant below 85 on any dimension.
+3. **Cross-domain consistency.** If the Financial agent scored 95 and the Legal agent scored
+   55 because of one open lawsuit, the Legal score is likely over-penalized — the dimension
+   measures material exposure, not any litigation activity. Revise Legal upward unless the
+   lawsuit has solvency implications.
+4. **Private-company softening.** Thin public financial visibility is a data-confidence
+   issue, not a risk signal. Do not let the Financial agent's "moderate confidence" flag
+   translate into a score deduction for an otherwise dominant private brand.
+
+Record both the `draft_score` and the final `reconciled_score` in the report's scoring table
+transparently — the calibration trail matters for audit.
+
+### Step 3 of synthesis — Select and prepare the logo
+
+1. **If the logo agent returned `fallback_used=false` with a usable `logo_url` or
+   `downloaded_path`:**
+   - Download the image if it's still remote (use `requests.get(logo_url)` with a timeout).
+   - Verify the file opens and has sane dimensions (min 200px wide for SVG or 400px for PNG).
+   - Prepare the image as a reportlab flowable:
+     ```python
+     from reportlab.platypus import Image
+     tenant_logo = Image(downloaded_path, width=180, height=50, kind='proportional')
+     ```
+   - Use this `tenant_logo` flowable on BOTH the full-report cover AND the 1-page summary
+     header. Ignore the Drawing returned by `build_cover_logos()` for the tenant (still use
+     `build_cover_logos()` for the Rising Tide logo).
+2. **If the logo agent returned `fallback_used=true`:**
+   - Call `build_cover_logos(company_name)` as the fallback — it returns a text-based logo
+     Drawing that respects `BRAND_COLORS` lookup.
+   - If the logo agent also returned a `brand_color_hex` that isn't already in `BRAND_COLORS`,
+     pass it to `build_tenant_logo(company_name, brand_color=HexColor(brand_color_hex))`
+     to produce a color-correct text logo.
+3. **Sanity check.** Render a preview of the chosen logo flowable before committing to the
+   PDF build. If the rendered height exceeds the cover's allocated band (~70pt) or the
+   aspect ratio is distorted, fall back to the text logo.
+
+Only after the synthesis phase is complete does the main agent proceed to **Step 4** (composite
+scoring formalization) and the **PDF build**. The PDFs are built using the reconciled findings,
+reconciled scores, and selected logo.
+
 ## Step 4: Composite Risk Score
 
 ### The Principal Question
@@ -306,10 +629,12 @@ Before scoring, explicitly research and answer:
   unrated. Is the outlook stable, positive, or negative?
 
 A Fortune 500 company with investment-grade credit, decades of lease payment history, and a
-corporate guarantee should score well on the composite even if it has labor disputes, CEO
-turnover, or ESG controversies. Those factors inform negotiation strategy and lease structure
-— they don't make the company unable to pay rent. Don't let secondary concerns drag down the
-score of a fundamentally creditworthy tenant.
+corporate guarantee should score in the mid-to-upper 90s on the composite — not the low 90s —
+even if it has labor disputes, CEO turnover, or ESG controversies. Those factors inform
+negotiation strategy and lease structure; they do not make the company unable to pay rent.
+Do not let secondary concerns drag down the score of a fundamentally creditworthy tenant. An
+elite private brand (dominant market position, no default history, healthy financials) belongs
+in the same 95+ composite range as its investment-grade public peers.
 
 ### Scoring Framework
 
@@ -335,6 +660,22 @@ if it's severe enough to actually impair the tenant's ability to meet rent oblig
 The Leadership & Personnel dimension still matters — executive instability is often a leading
 indicator of financial trouble — but it shouldn't dominate the score for a company that is
 demonstrably solvent and creditworthy.
+
+**Cross-dimension calibration archetypes (for the composite):**
+
+| Profile | Composite target | Typical per-dimension range |
+|---------|------------------|-----------------------------|
+| Elite blue-chip (Apple, Costco, Chick-fil-A, Publix) | 94–98 | Financial 95+, Market 95+, Leadership 90–95, Legal 90+, CRE Track 92+, Industry 85–95 |
+| Strong national chain (Starbucks, McDonald's, Home Depot, Target) | 88–93 | Financial 88–94, Market 88–94, Leadership 85–92, Legal 85–95, CRE Track 85–92, Industry 80–92 |
+| Mid-tier national / large regional | 80–87 | Financial 80–88, Market 78–87, Leadership 78–88, Legal 82–92, CRE Track 80–88, Industry 75–88 |
+| Regional operator with healthy fundamentals | 72–80 | Financial 72–82, Market 70–80, Leadership 72–85, Legal 80–90, CRE Track 72–82, Industry 70–85 |
+| Softening fundamentals or thin financial visibility | 62–72 | Financial 60–72, Market 60–75, Leadership 60–80, Legal 70–90, CRE Track 60–75, Industry 60–80 |
+| Meaningful credit stress, high-yield + negative outlook | 52–62 | Financial 45–60, Market 50–70, Leadership 50–75, Legal 50–85, CRE Track 50–65, Industry 55–75 |
+| Prior lease default, active restructuring risk | Below 52 | Financial below 50, others vary |
+
+A tenant matching the elite blue-chip profile should land **94 or higher** on the composite. If
+your per-dimension scoring produces a lower result for such a tenant, the issue is almost always
+that one or more dimensions were marked too harshly — revisit them before finalizing.
 
 **Scoring bands:**
 
@@ -569,6 +910,12 @@ story.append(Paragraph(
 **Page 1 — Cover**
 - **Rising Tide Property Group logo** (top of page) — generated using bundled `scripts/logos.py`
 - **Tenant company logo** (below Rising Tide logo) — generated using bundled `scripts/logos.py`
+- **Legal entity name** (prominent, below the tenant logo)
+- **Key-facts block** (compact 4-line table, centered, below the legal entity name):
+    - Entity type | State of Incorporation
+    - Website URL
+    - Parent company (if any; otherwise omit this line)
+    - HQ location
 - "Tenant Research & Risk Analysis"
 - Date of report
 - "For informational purposes only. See Disclaimers & Limitations." (small text, bottom of cover)
@@ -623,8 +970,41 @@ story.append(HRFlowable(width="40%", thickness=1.5, color=NAVY, hAlign='CENTER')
 story.append(Spacer(1, 0.5*inch))
 story.append(CenteredDrawing(tenant_logo))           # Tenant logo
 story.append(Spacer(1, 6))
+
+# Legal entity name — bold, centered, directly below tenant logo
+story.append(Paragraph(
+    legal_entity_name,  # e.g., "Chick-fil-A, Inc."
+    legal_name_style    # Helvetica-Bold, 16pt, centered, navy
+))
+story.append(Spacer(1, 0.1*inch))
+
+# Key-facts block — compact centered table, no visible borders
+key_facts_data = [
+    [Paragraph(f"<b>{entity_type}</b>", fact_label_style),
+     Paragraph(f"Inc. in {state_of_incorp}", fact_label_style)],
+    [Paragraph(f'<link href="{website_url}">{website_url}</link>', fact_link_style), ''],
+    [Paragraph(f"Parent: {parent_company}", fact_label_style), ''] if parent_company else None,
+    [Paragraph(f"HQ: {hq_location}", fact_label_style), ''],
+]
+key_facts_data = [row for row in key_facts_data if row is not None]
+key_facts_table = Table(key_facts_data, hAlign='CENTER', colWidths=[2.5*inch, 2.5*inch])
+key_facts_table.setStyle(TableStyle([
+    ('FONTSIZE', (0,0), (-1,-1), 9),
+    ('TEXTCOLOR', (0,0), (-1,-1), SLATE),
+    ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+    ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+    ('TOPPADDING', (0,0), (-1,-1), 2),
+]))
+story.append(key_facts_table)
+story.append(Spacer(1, 0.3*inch))
+
 # ... subtitle, report title, property details, confidential badge (all alignment=1 centered)
 ```
+
+Visual note: adding the legal-entity name + key-facts table pushes the report title/date
+downward on the cover. If the date crowds the bottom margin on first render, tighten the
+upper Spacers from 0.6→0.4 inch.
 
 The logos are **vector Drawing objects** (reportlab.graphics.shapes.Drawing), which are Flowable
 objects that render at any resolution without pixelation. The `build_cover_logos()` function
@@ -816,15 +1196,121 @@ Use all available tools aggressively:
 
 ## File Output
 
-The final PDF must be saved to a location the user can access. Follow these steps:
-1. Build the PDF using reportlab and save it first to your working directory
-2. Then explicitly copy the PDF to the user's workspace folder (typically the mounted folder
+Two PDFs must be saved to a location the user can access: the full report AND a 1-page
+summary (see next section). Both are required deliverables. Follow these steps:
+1. Build both PDFs using reportlab and save them first to your working directory
+2. Then explicitly copy BOTH PDFs to the user's workspace folder (typically the mounted folder
    at `/sessions/*/mnt/*/` — check which directory is available)
-3. Verify the file exists at the destination using `os.path.exists()` or an `ls` command
-4. Name the file: `[Company-Name]-Tenant-Research.pdf` (e.g., `Starbucks-Tenant-Research.pdf`)
-5. If an output directory was specified in the task, save there AND to the workspace folder
+3. Verify both files exist at the destination using `os.path.exists()` or an `ls` command
+4. Name the full file: `[Company-Name]-Tenant-Research.pdf` AND produce a 1-page summary at
+   `[Company-Name]-Tenant-Summary.pdf` per the next section. Both files are required
+   deliverables — do not skip the summary even if the full report is complete.
+5. If an output directory was specified in the task, save both files there AND to the
+   workspace folder
 
-The PDF is the deliverable. If it doesn't end up where the user can find it, the work is wasted.
+The PDFs are the deliverable. If they don't end up where the user can find them, the work
+is wasted.
+
+## 1-Page Summary Deliverable
+
+Alongside `[Company-Name]-Tenant-Research.pdf`, generate a second PDF named
+`[Company-Name]-Tenant-Summary.pdf` that is a single-page scannable excerpt. This file exists
+because investment-committee members often need a 30-second read before deciding whether to
+open the full report. Both files are required deliverables.
+
+### File location
+
+Save the summary alongside the full report (same directory, same workspace mount). No subfolder.
+Filename exactly `[Company-Name]-Tenant-Summary.pdf` (strip punctuation/spaces from the company
+name into a filename-safe form, same convention as the full report).
+
+### Page layout (one page, US Letter, 0.6" margins)
+
+**Header band (top ~1.3 inches):**
+- Row 1: Rising Tide logo (~200pt wide) on left, tenant logo (~180pt wide) on right.
+  Use `build_cover_logos(company_name)` from `scripts/logos.py` — the same call used on the
+  full-report cover. This guarantees brand-color and rendering consistency.
+- Row 2: Legal entity name (bold, 16pt, centered) with entity type + state of incorporation
+  on a single line (e.g., "Chick-fil-A, Inc. — Georgia corporation").
+
+**Composite score block (~1.5 inches):**
+- Large composite score and letter grade, centered, colored by grade band.
+- Use `build_score_dashboard(...)` from `scripts/charts.py`. If the full dashboard is too tall
+  for the 1-pager, render only the composite card + a horizontal 6-bar dimension strip.
+- One-line recommendation immediately beneath (e.g., "Suitable for 10-year NNN lease with
+  standard security deposit").
+
+**Key-facts box (~1.2 inches):**
+Two-column table, no visible borders, slate text on a very light navy tint. Use Paragraph
+objects for wrapping. Rows:
+- Website
+- Entity type
+- State of incorporation
+- State registration doc #
+- Registered agent
+- Parent company ("None — independent" if not applicable)
+- HQ
+
+**Executive narrative (3–4 sentences, ~1 inch):**
+Reuse the EXACT narrative from the full report's Executive Summary. Do not rewrite — consistency
+between the two PDFs matters. If the full-report narrative is longer than 4 sentences, trim
+to the 3–4 most important sentences.
+
+**Strengths and risks (side-by-side, ~1.8 inches):**
+Two columns. Left header "Top 3 Strengths" (green band). Right header "Top 3 Risks" (amber
+band). Three bullets each, 1–2 lines max per bullet. Reuse the bullets from the full report's
+exec summary.
+
+**Lease recommendation block (~0.6 inches):**
+One of three labels in a colored band:
+- **Approve** (green #2D7D46) — "Suitable for standard lease terms."
+- **Conditional** (amber #D4A017) — "Suitable with enhanced guarantees / financial covenants /
+  larger security deposit."
+- **Decline** (red #C0392B) — "Not recommended; credit risk exceeds acceptable threshold."
+
+Followed by one sentence of rationale pulled from the full report.
+
+**Footer (~0.3 inches):**
+Small 8pt centered text:
+
+```
+This is a summary excerpt. See [Company-Name]-Tenant-Research.pdf for full analysis,
+scoring methodology, and disclaimers. | Generated [YYYY-MM-DD] | © [YEAR] Rising Tide CRE.
+```
+
+### Implementation pattern
+
+Build the summary as a second `SimpleDocTemplate` in the same Python script run as the full
+report — narrative, score, strengths, and risks are computed once and used in both PDFs.
+
+```python
+summary_doc = SimpleDocTemplate(
+    summary_output_path,
+    pagesize=letter,
+    leftMargin=0.6*inch, rightMargin=0.6*inch,
+    topMargin=0.5*inch, bottomMargin=0.4*inch,
+)
+summary_story = []
+rt_logo, tenant_logo = build_cover_logos(company_name)  # SAME call as full report
+# ... 2-column table for header band (RT left, tenant right)
+# ... legal name row
+# ... composite score / dashboard (compact)
+# ... key-facts table
+# ... exec narrative Paragraph (reuse the variable from the full report)
+# ... strengths/risks 2-column Table (reuse the bullet lists)
+# ... recommendation band
+# ... footer
+summary_doc.build(summary_story)
+```
+
+### Important
+
+- **The 1-pager MUST use `build_cover_logos()`** — same tenant logo as the full-report cover.
+  Do not fall back to a text-only header.
+- **The 1-pager is not a standalone sales document.** It must reference the full report by
+  filename in the footer.
+- **Do not add disclaimers to the 1-pager body** — the footer's pointer to the full report is
+  the liability bridge. The full report carries the dedicated Disclaimers page.
 
 ## Slack Distribution
 
@@ -863,6 +1349,7 @@ searchable, linkable, and readable on any device.
 **Canvas structure should mirror the PDF sections:**
 - Deal Summary (economics table at the top)
 - Executive Summary with composite score, strengths, risks, recommendation
+- Section A.0: Company Fundamentals & Structure (entity, state of incorp, registration, parent, website)
 - Section A: Financial Health & Creditworthiness
 - Section B: Market & Competitive Position
 - Section C: Leadership, Personnel & Organizational Health
